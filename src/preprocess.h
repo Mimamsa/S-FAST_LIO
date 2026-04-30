@@ -12,7 +12,8 @@ typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
 enum LID_TYPE
 {
-  AVIA = 1,
+  //AVIA = 1,
+  MID360 = 1,
   VELO16,
   OUST64,
   RS32
@@ -94,6 +95,28 @@ namespace rslidar_ros
 POINT_CLOUD_REGISTER_POINT_STRUCT(rslidar_ros::Point,
                                   (float, x, x)(float, y, y)(float, z, z)(uint8_t, intensity, intensity)(uint16_t, ring, ring)(double, timestamp, timestamp))
 
+namespace mid360_ros
+{
+  struct EIGEN_ALIGN16 Point
+  {
+    PCL_ADD_POINT4D;
+    float intensity;
+    uint8_t tag;
+    uint8_t line;
+    double timestamp;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  };
+} // namespace mid360_ros
+POINT_CLOUD_REGISTER_POINT_STRUCT(mid360_ros::Point,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (std::uint8_t, tag, tag)
+    (std::uint8_t, line, line)
+    (double, timestamp, timestamp)
+)
+
 namespace ouster_ros
 {
   struct EIGEN_ALIGN16 Point
@@ -151,6 +174,7 @@ class Preprocess
   private:
   void rs_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
 //  void avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg);
+  void mid360_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
