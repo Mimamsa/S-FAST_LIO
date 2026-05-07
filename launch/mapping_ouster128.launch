@@ -1,5 +1,5 @@
 <launch>
-<!-- Launch file for ouster OS2-64 LiDAR -->
+<!-- Launch file for ouster OS2-128 LiDAR -->
 
     <arg name="rviz" default="false" />
 

@@ -107,6 +107,7 @@ namespace mid360_ros
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   };
 } // namespace mid360_ros
+
 POINT_CLOUD_REGISTER_POINT_STRUCT(mid360_ros::Point,
     (float, x, x)
     (float, y, y)

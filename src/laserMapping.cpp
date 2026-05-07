@@ -76,6 +76,9 @@ KD_TREE<PointType> ikdtree;
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
+Eigen::Quaterniond Q_world_gravity_aligned = Eigen::Quaterniond::Identity();
+M3D R_world_gravity_aligned(Eye3d);
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 
@@ -90,6 +93,18 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 
+/**
+ * @brief Signal handler for graceful shutdown
+ * 
+ * Captures system signals (e.g., SIGINT from Ctrl+C) and sets exit flag.
+ * Notifies all waiting threads to terminate safely.
+ * 
+ * @param sig Signal number
+ * 
+ * @note
+ * - Sets global flag `flg_exit`
+ * - Wakes up threads waiting on condition variable
+ */
 void SigHandle(int sig)
 {
     flg_exit = true;
@@ -97,11 +112,26 @@ void SigHandle(int sig)
     sig_buffer.notify_all();
 }
 
+/**
+ * @brief Standard LiDAR callback function (ROS subscriber)
+ * 
+ * This function receives raw PointCloud2 messages, preprocesses them,
+ * and pushes them into a buffer for later synchronization with IMU data.
+ * 
+ * Thread-safe using mutex and condition variable.
+ * 
+ * @param msg Incoming ROS PointCloud2 message
+ * 
+ * @note
+ * - Detects timestamp rollback and clears buffer
+ * - Uses Preprocess class to convert ROS msg → PCL format
+ * - Maintains lidar_buffer and time_buffer
+ */
 void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
     mtx_buffer.lock();
     scan_count++;
-    double preprocess_start_time = omp_get_wtime();
+    // double preprocess_start_time = omp_get_wtime();
     if (msg->header.stamp.toSec() < last_timestamp_lidar)
     {
         ROS_ERROR("lidar loop back, clear buffer");
@@ -154,6 +184,19 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 }
 */
 
+/**
+ * @brief IMU callback function
+ * 
+ * Receives IMU measurements and stores them in a buffer.
+ * Applies optional time synchronization offset between LiDAR and IMU.
+ * 
+ * @param msg_in Incoming IMU message
+ * 
+ * @note
+ * - Handles timestamp rollback
+ * - Supports external or self time synchronization
+ * - Buffered for later fusion with LiDAR
+ */
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
     publish_count++;
@@ -188,6 +231,21 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 double lidar_mean_scantime = 0.0;
 int scan_num = 0;
 //把当前要处理的LIDAR和IMU数据打包到meas
+/**
+ * @brief Synchronize LiDAR and IMU measurements
+ * 
+ * This function extracts one LiDAR scan and all corresponding IMU data
+ * within the scan time interval, forming a MeasureGroup.
+ * 
+ * @param meas Output measurement group (LiDAR + IMU)
+ * @return true if a valid synchronized package is ready
+ * @return false if data is insufficient
+ * 
+ * @note
+ * - Uses lidar_buffer and imu_buffer
+ * - Estimates scan end time using point timestamp (curvature field)
+ * - Ensures IMU covers entire LiDAR scan duration
+ */
 bool sync_packages(MeasureGroup &meas)
 {
     if (lidar_buffer.empty() || imu_buffer.empty())
@@ -244,10 +302,28 @@ bool sync_packages(MeasureGroup &meas)
     return true;
 }
 
+/**
+ * @brief Transform point from LiDAR (body frame) to world frame
+ * 
+ * @param pi Input point in LiDAR frame
+ * @param po Output point in world frame
+ * 
+ * Applies:
+ *   LiDAR → IMU extrinsic (EKF state)
+ *   IMU → World pose (EKF state)
+ * 
+ * @note
+ * Transformation chain:
+ *   p_world = R_world_imu * (R_imu_lidar * p_lidar + t_imu_lidar) + t_world_imu
+ */
 void pointBodyToWorld(PointType const *const pi, PointType *const po)
 {
     V3D p_body(pi->x, pi->y, pi->z);
-    V3D p_global(state_point.rot.matrix() * (state_point.offset_R_L_I.matrix() * p_body + state_point.offset_T_L_I) + state_point.pos);
+    V3D p_global(
+        state_point.rot.matrix() * \
+        (state_point.offset_R_L_I.matrix() * p_body + state_point.offset_T_L_I) + \
+        state_point.pos
+    );
 
     po->x = p_global(0);
     po->y = p_global(1);
@@ -255,19 +331,65 @@ void pointBodyToWorld(PointType const *const pi, PointType *const po)
     po->intensity = pi->intensity;
 }
 
+/**
+ * @brief Transform Eigen vector point from LiDAR frame to world frame
+ * 
+ * Template version of coordinate transformation for Eigen types.
+ * Applies LiDAR→IMU extrinsic and IMU→World pose transformation.
+ * 
+ * @tparam T Scalar type (float/double)
+ * @param pi Input point in LiDAR frame
+ * @param po Output point in world frame
+ */
 template <typename T>
 void pointBodyToWorld(const Matrix<T, 3, 1> &pi, Matrix<T, 3, 1> &po)
 {
     V3D p_body(pi[0], pi[1], pi[2]);
-    V3D p_global(state_point.rot.matrix() * (state_point.offset_R_L_I.matrix() * p_body + state_point.offset_T_L_I) + state_point.pos);
+    V3D p_global(
+        state_point.rot.matrix() * \
+        (state_point.offset_R_L_I.matrix() * p_body + state_point.offset_T_L_I) + \
+        state_point.pos
+    );
 
     po[0] = p_global(0);
     po[1] = p_global(1);
     po[2] = p_global(2);
 }
 
+/**
+ * @brief Rotate point according to the origin
+ * 
+ * @param pi Input point
+ * @param po Output point
+ * @param r_mtx Rotation matrix
+ * 
+ * @note
+ * Transformation chain:
+ *   po = R * pi
+ */
+void pointRotate(PointType const *const pi, PointType *const po, M3D &r_mtx)
+{
+    V3D pi_eigen(pi->x, pi->y, pi->z);
+    V3D po_eigen(r_mtx * pi_eigen);
+
+    po->x = po_eigen(0);
+    po->y = po_eigen(1);
+    po->z = po_eigen(2);
+}
+
 BoxPointType LocalMap_Points;      // ikd-tree地图立方体的2个角点
 bool Localmap_Initialized = false; // 局部地图是否初始化
+/**
+ * @brief Maintain sliding local map region (FOV-based)
+ * 
+ * Keeps only a local cube of map points around current LiDAR position.
+ * Removes points outside the region to control memory and computation.
+ * 
+ * @note
+ * - Implements moving local map (sliding window)
+ * - Based on DET_RANGE and MOV_THRESHOLD
+ * - Uses ikdtree.Delete_Point_Boxes()
+ */
 void lasermap_fov_segment()
 {
     cub_needrm.clear(); // 清空需要移除的区域
@@ -294,8 +416,11 @@ void lasermap_fov_segment()
         dist_to_map_edge[i][0] = fabs(pos_LiD(i) - LocalMap_Points.vertex_min[i]);
         dist_to_map_edge[i][1] = fabs(pos_LiD(i) - LocalMap_Points.vertex_max[i]);
         // 与某个方向上的边界距离（1.5*300m）太小，标记需要移除need_move(FAST-LIO2论文Fig.3)
-        if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE || dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE)
+        if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * DET_RANGE || \
+            dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE)
+        {
             need_move = true;
+        }
     }
     if (!need_move)
         return; //如果不需要，直接返回，不更改局部地图
@@ -331,6 +456,19 @@ void lasermap_fov_segment()
         kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm); //删除指定范围内的点
 }
 
+/**
+ * @brief Transform point from LiDAR frame to IMU body frame
+ * 
+ * Applies only extrinsic calibration between LiDAR and IMU.
+ * Does NOT transform to world frame.
+ * 
+ * @param pi Input point in LiDAR frame
+ * @param po Output point in IMU frame
+ * 
+ * @note
+ * Transformation:
+ *   p_imu = R_i_l * p_lidar + t_i_l
+ */
 void RGBpointBodyLidarToIMU(PointType const *const pi, PointType *const po)
 {
     V3D p_body_lidar(pi->x, pi->y, pi->z);
@@ -343,6 +481,20 @@ void RGBpointBodyLidarToIMU(PointType const *const pi, PointType *const po)
 }
 
 //根据最新估计位姿  增量添加点云到map
+/**
+ * @brief Incrementally add new points into ikd-tree map
+ * 
+ * This function:
+ * 1. Transforms points into world frame
+ * 2. Performs voxel-based filtering
+ * 3. Checks nearest neighbors to avoid redundancy
+ * 4. Inserts selected points into ikd-tree
+ * 
+ * @note
+ * - Uses Nearest_Points from scan matching
+ * - Avoids adding points if similar ones already exist
+ * - Maintains map sparsity
+ */
 void map_incremental()
 {
     PointVector PointToAdd;
@@ -364,7 +516,10 @@ void map_incremental()
             mid_point.y = floor(feats_down_world->points[i].y / filter_size_map_min) * filter_size_map_min + 0.5 * filter_size_map_min;
             mid_point.z = floor(feats_down_world->points[i].z / filter_size_map_min) * filter_size_map_min + 0.5 * filter_size_map_min;
             float dist = calc_dist(feats_down_world->points[i], mid_point);
-            if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min && fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min && fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min)
+
+            if (fabs(points_near[0].x - mid_point.x) > 0.5 * filter_size_map_min && \
+                fabs(points_near[0].y - mid_point.y) > 0.5 * filter_size_map_min && \
+                fabs(points_near[0].z - mid_point.z) > 0.5 * filter_size_map_min)
             {
                 PointNoNeedDownsample.push_back(feats_down_world->points[i]); //如果距离最近的点都在体素外，则该点不需要Downsample
                 continue;
@@ -396,6 +551,19 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+/**
+ * @brief Publish current LiDAR frame in world coordinate system
+ * 
+ * Transforms point cloud into world frame and publishes it.
+ * Optionally accumulates and saves point clouds to PCD files.
+ * 
+ * @param pubLaserCloudFull_ ROS publisher for world-frame point cloud
+ * 
+ * @note
+ * - Uses either dense or downsampled point cloud
+ * - Frame ID: "camera_init"
+ * - Can significantly affect performance if PCD saving is enabled
+ */
 void publish_frame_world(const ros::Publisher &pubLaserCloudFull_)
 {
     if (scan_pub_en)
@@ -407,8 +575,8 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull_)
 
         for (int i = 0; i < size; i++)
         {
-            pointBodyToWorld(&laserCloudFullRes->points[i],
-                             &laserCloudWorld->points[i]);
+            pointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
+            pointRotate(&laserCloudWorld->points[i], &laserCloudWorld->points[i], R_world_gravity_aligned);
         }
 
         sensor_msgs::PointCloud2 laserCloudmsg;
@@ -430,8 +598,8 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull_)
 
         for (int i = 0; i < size; i++)
         {
-            pointBodyToWorld(&feats_undistort->points[i],
-                             &laserCloudWorld->points[i]);
+            pointBodyToWorld(&feats_undistort->points[i], &laserCloudWorld->points[i]);
+            pointRotate(&laserCloudWorld->points[i], &laserCloudWorld->points[i], R_world_gravity_aligned);
         }
 
         static int scan_wait_num = 0;
@@ -453,6 +621,17 @@ void publish_frame_world(const ros::Publisher &pubLaserCloudFull_)
     }
 }
 
+ /**
+ * @brief Publish current LiDAR frame in IMU body frame
+ * 
+ * Transforms undistorted point cloud into IMU frame and publishes it.
+ * 
+ * @param pubLaserCloudFull_body ROS publisher for body-frame point cloud
+ * 
+ * @note
+ * - Frame ID: "body"
+ * - Requires scan_pub_en && scan_body_pub_en enabled
+ */
 void publish_frame_body(const ros::Publisher &pubLaserCloudFull_body)
 {
     int size = feats_undistort->points.size();
@@ -472,6 +651,17 @@ void publish_frame_body(const ros::Publisher &pubLaserCloudFull_body)
     publish_count -= PUBFRAME_PERIOD;
 }
 
+/**
+ * @brief Publish global map point cloud
+ * 
+ * Converts internal map representation into ROS PointCloud2 message.
+ * 
+ * @param pubLaserCloudMap ROS publisher for map
+ * 
+ * @note
+ * - Uses featsFromMap
+ * - Frame ID: "camera_init"
+ */
 void publish_map(const ros::Publisher &pubLaserCloudMap)
 {
     sensor_msgs::PointCloud2 laserCloudMap;
@@ -481,26 +671,105 @@ void publish_map(const ros::Publisher &pubLaserCloudMap)
     pubLaserCloudMap.publish(laserCloudMap);
 }
 
-template <typename T>
-void set_posestamp(T &out)
-{
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
+/**
+ * @brief Fill pose message with current EKF state
+ * 
+ * Sets position and orientation (quaternion) from state_point.
+ * 
+ * @param T ROS message type containing pose field
+ * @param out Output pose message
+ * 
+ * @note
+ * - Orientation derived from rotation matrix
+ * - Used for Odometry and Path messages
+ */
+// template <typename T>
+// void set_posestamp(T &out)
+// {
+//     out.pose.position.x = state_point.pos(0);
+//     out.pose.position.y = state_point.pos(1);
+//     out.pose.position.z = state_point.pos(2);
 
-    auto q_ = Eigen::Quaterniond(state_point.rot.matrix());
-    out.pose.orientation.x = q_.coeffs()[0];
-    out.pose.orientation.y = q_.coeffs()[1];
-    out.pose.orientation.z = q_.coeffs()[2];
-    out.pose.orientation.w = q_.coeffs()[3];
+//     auto q_ = Eigen::Quaterniond(state_point.rot.matrix());
+//     //q_ = Q_world_gravity_aligned * q_;
+//     out.pose.orientation.x = q_.coeffs()[0];
+//     out.pose.orientation.y = q_.coeffs()[1];
+//     out.pose.orientation.z = q_.coeffs()[2];
+//     out.pose.orientation.w = q_.coeffs()[3];
+// }
+
+/**
+ * @brief Get current position and rotation from EKF state
+ * 
+ * @param[in] ekf_state_point EKF state point
+ * @param[out] tvec Output position
+ * @param[out] quat Output rotation
+ * 
+ * @note
+ * - Used for Odometry and Path messages
+ */
+void get_ekf_state_point(state_ikfom &ekf_state_point, V3D &tvec, Eigen::Quaterniond &quat)
+{
+    tvec = Eigen::Vector3d(ekf_state_point.pos);
+    quat = Eigen::Quaterniond(state_point.rot.matrix());
 }
 
+/**
+ * @brief Get current position and rotation from EKF state
+ * 
+ * @param[in] tvec Input position
+ * @param[in] quat Input rotation
+ * @param[out] out ROS message type containing pose field
+ * 
+ * @note
+ * - Used for Odometry and Path messages
+ */
+template <typename T>
+void set_stamped_pose(V3D &tvec, Eigen::Quaterniond &quat, T &out)
+{
+    out.pose.position.x = tvec(0);
+    out.pose.position.y = tvec(1);
+    out.pose.position.z = tvec(2);
+
+    out.pose.orientation.x = quat.coeffs()[0];
+    out.pose.orientation.y = quat.coeffs()[1];
+    out.pose.orientation.z = quat.coeffs()[2];
+    out.pose.orientation.w = quat.coeffs()[3];
+}
+
+/**
+ * @brief Publish odometry and broadcast TF transform
+ * 
+ * Publishes robot pose estimated by EKF as nav_msgs::Odometry.
+ * Also broadcasts TF transform from world to body frame.
+ * 
+ * @param pubOdomAftMapped ROS publisher for odometry
+ * 
+ * @note
+ * - Frame: "camera_init" → "body"
+ * - Includes covariance from EKF
+ * - TF broadcaster is static inside function
+ */
 void publish_odometry(const ros::Publisher &pubOdomAftMapped)
 {
+    // ----- Publish odometry -----
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
+    // set_posestamp(odomAftMapped.pose);  // Fill pose message with current EKF state
+
+    // Get EKF state point in Eigen datatype (position and rotation)
+    V3D ekf_pos_;
+    Eigen::Quaterniond ekf_quat_;
+    get_ekf_state_point(state_point, ekf_pos_, ekf_quat_);
+
+    // transform EKF state point
+    ekf_pos_ = Q_world_gravity_aligned * ekf_pos_;
+    ekf_quat_ = Q_world_gravity_aligned * ekf_quat_;
+
+    // Set transfored EKF state point to message
+    set_stamped_pose(ekf_pos_, ekf_quat_, odomAftMapped.pose);
+
     pubOdomAftMapped.publish(odomAftMapped);
 
     auto P = kf.get_P();
@@ -515,6 +784,7 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
         odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
     }
 
+    // ----- Broadcast TF transform -----
     static tf::TransformBroadcaster br;
     tf::Transform transform;
     tf::Quaternion q;
@@ -529,13 +799,37 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
     br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "body"));
 }
 
+/**
+ * @brief Publish trajectory path
+ * 
+ * Appends current pose to path and publishes it periodically.
+ * 
+ * @param pubPath ROS publisher for nav_msgs::Path
+ * 
+ * @note
+ * - Publishes every 10 frames to reduce load
+ * - Large path may crash RViz if not controlled
+ */
 void publish_path(const ros::Publisher pubPath)
 {
-    set_posestamp(msg_body_pose);
+    //set_posestamp(msg_body_pose);
+
+    // Get EKF state point in Eigen datatype (position and rotation)
+    V3D ekf_pos_;
+    Eigen::Quaterniond ekf_quat_;
+    get_ekf_state_point(state_point, ekf_pos_, ekf_quat_);
+
+    // transform EKF state point
+    ekf_pos_ = Q_world_gravity_aligned * ekf_pos_;
+    ekf_quat_ = Q_world_gravity_aligned * ekf_quat_;
+
+    // Set transfored EKF state point to message
+    set_stamped_pose(ekf_pos_, ekf_quat_, msg_body_pose);
+
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
     msg_body_pose.header.frame_id = "camera_init";
 
-    /*** if path is too large, the rvis will crash ***/
+    /*** if path is too large, the rviz will crash ***/
     static int jjj = 0;
     jjj++;
     if (jjj % 10 == 0)
@@ -545,6 +839,22 @@ void publish_path(const ros::Publisher pubPath)
     }
 }
 
+/**
+ * @brief Main SLAM loop
+ * 
+ * Pipeline:
+ * 1. Receive sensor data
+ * 2. Synchronize LiDAR + IMU
+ * 3. Undistort point cloud using IMU
+ * 4. Downsample
+ * 5. Perform EKF update (scan-to-map)
+ * 6. Update map (ikd-tree)
+ * 7. Publish odometry and point clouds
+ * 
+ * @note
+ * - Runs at high frequency (5000 Hz loop)
+ * - Core computation triggered only when sync_packages() succeeds
+ */
 int main(int argc, char **argv)
 {
     ros::init(argc, argv, "laserMapping");
@@ -605,8 +915,14 @@ int main(int argc, char **argv)
     shared_ptr<ImuProcess> p_imu1(new ImuProcess());
     Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
     Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
-    p_imu1->set_param(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU, V3D(gyr_cov, gyr_cov, gyr_cov), V3D(acc_cov, acc_cov, acc_cov),
-                      V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov), V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu1->set_param(
+        Lidar_T_wrt_IMU,
+        Lidar_R_wrt_IMU,
+        V3D(gyr_cov, gyr_cov, gyr_cov),
+        V3D(acc_cov, acc_cov, acc_cov),
+        V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov),
+        V3D(b_acc_cov, b_acc_cov, b_acc_cov)
+    );
 
     signal(SIGINT, SigHandle); //当程序检测到signal信号（例如ctrl+c） 时  执行 SigHandle 函数
     ros::Rate rate(5000);
@@ -615,6 +931,7 @@ int main(int argc, char **argv)
     {
         if (flg_exit)
             break;
+
         ros::spinOnce();
 
         if (sync_packages(Measures)) //把一次的IMU和LIDAR数据打包到Measures
@@ -630,6 +947,10 @@ int main(int argc, char **argv)
             }
 
             p_imu1->Process(Measures, kf, feats_undistort);
+
+            Q_world_gravity_aligned = p_imu1->Q_world_gravity_aligned;
+            R_world_gravity_aligned = p_imu1->Q_world_gravity_aligned.toRotationMatrix();;
+            // std::cout << "R_world_gravity_aligned: \n" << p_imu1->R_world_gravity_aligned << std::endl;
 
             //如果feats_undistort为空 ROS_WARN
             if (feats_undistort->empty() || (feats_undistort == NULL))
@@ -662,10 +983,16 @@ int main(int argc, char **argv)
             {
                 ikdtree.set_downsample_param(filter_size_map_min);
                 feats_down_world->resize(feats_down_size);
+                
+                // Transform pointcloud from lidar frame to world frame, points by points
                 for (int i = 0; i < feats_down_size; i++)
                 {
-                    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i])); // lidar坐标系转到世界坐标系
+                    pointBodyToWorld(
+                        &(feats_down_body->points[i]),
+                        &(feats_down_world->points[i])
+                    ); // lidar坐标系转到世界坐标系
                 }
+                
                 ikdtree.Build(feats_down_world->points); //根据世界坐标系下的点构建ikdtree
                 continue;
             }

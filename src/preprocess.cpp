@@ -190,6 +190,7 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
   }
 }
 */
+
 void Preprocess::mid360_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
   pl_surf.clear();
@@ -232,7 +233,9 @@ void Preprocess::mid360_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
       if (yaw_angle <= -180.0)
         yaw_angle += 360.0;
 
-      //added_pt.curvature = pl_orig.points[i].timestamp * 1.e3f;  // curvature unit: ms
+      // curvature (double): The time offset wrt to the first point (within the same measure group)
+      added_pt.curvature = (pl_orig.points[i].timestamp - pl_orig.points[0].timestamp) * \
+                           1.e-3f * time_unit_scale;  // curvature unit: ms
     }
 
     for (int j = 0; j < N_SCANS; j++)
@@ -281,7 +284,9 @@ void Preprocess::mid360_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
       added_pt.normal_z = 0;
-      //added_pt.curvature = pl_orig.points[i].timestamp * 1.e3f;  // curvature unit: ms
+      // curvature (double): The time offset wrt to the first point (within the same measure group)
+      added_pt.curvature = (pl_orig.points[i].timestamp - pl_orig.points[0].timestamp) * \
+                           1.e-3f * time_unit_scale;  // curvature unit: ms
 
       pl_surf.points.push_back(added_pt);
     }

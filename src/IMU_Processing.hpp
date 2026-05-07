@@ -7,6 +7,7 @@
 #include <csignal>
 #include <ros/ros.h>
 #include <Eigen/Eigen>
+#include <Eigen/Geometry>
 #include <common_lib.h>
 #include <pcl/common/io.h>
 #include <pcl/point_cloud.h>
@@ -31,9 +32,41 @@ IMU数据预处理：IMU初始化，IMU正向传播，反向传播补偿运动�
 */
 
 #define MAX_INI_COUNT (10)  //最大迭代次数
+
 //判断点的时间先后顺序(注意curvature中存储的是时间戳)
+/**
+ * @brief Comparator for sorting LiDAR points by timestamp.
+ *
+ * This function compares two points based on their relative timestamp,
+ * which is stored in the `curvature` field.
+ *
+ * @param[in] x First point
+ * @param[in] y Second point
+ * @return true if x occurs earlier than y
+ *
+ * @note
+ * - The `curvature` field is repurposed to store time (increasing order).
+ * - This is a non-standard usage and may reduce code readability.
+ * - Recommended to use a dedicated timestamp field instead.
+ */
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 
+/**
+ * @class ImuProcess
+ * @brief IMU-based motion compensation and initialization module for LiDAR-Inertial SLAM.
+ *
+ * This class handles:
+ * 1. IMU initialization (gravity, bias estimation)
+ * 2. Forward propagation using IMU measurements (state prediction)
+ * 3. LiDAR point cloud motion undistortion using IMU trajectory
+ *
+ * It is designed to work with an error-state EKF (ESKF) framework.
+ *
+ * Key assumptions:
+ * - IMU and LiDAR are time-synchronized
+ * - Each LiDAR point contains relative timestamp (stored in curvature field)
+ * - IMU noise follows Gaussian distribution
+ */
 class ImuProcess
 {
  public:
@@ -46,6 +79,7 @@ class ImuProcess
   void set_param(const V3D &transl, const M3D &rot, const V3D &gyr, const V3D &acc, const V3D &gyr_bias, const V3D &acc_bias);
   Eigen::Matrix<double, 12, 12> Q;    //噪声协方差矩阵  对应论文式(8)中的Q
   void Process(const MeasureGroup &meas, esekfom::esekf &kf_state, PointCloudXYZI::Ptr &pcl_un_);
+  void GetRotationBetweenVectors(const V3D &u, const V3D &v, Eigen::Quaterniond &out_rotmat);
 
   V3D cov_acc;             //加速度协方差
   V3D cov_gyr;             //角速度协方差
@@ -54,6 +88,7 @@ class ImuProcess
   V3D cov_bias_gyr;        //角速度bias的协方差
   V3D cov_bias_acc;        //加速度bias的协方差
   double first_lidar_time; //当前帧第一个点云时间
+  Eigen::Quaterniond Q_world_gravity_aligned; // rotation Q for gravity aligned
 
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, int &N);
@@ -75,6 +110,21 @@ class ImuProcess
   bool imu_need_init_ = true;             //是否需要初始化imu
 };
 
+/**
+ * @brief Constructor for ImuProcess.
+ *
+ * Initializes IMU processing module with default parameters, including:
+ * - Noise covariance matrix (Q)
+ * - IMU measurement covariance (acc & gyro)
+ * - Bias covariance
+ * - Initial gravity direction assumption
+ * - LiDAR–IMU extrinsic parameters (identity / zero)
+ *
+ * @note
+ * - Gravity is initialized as (0, 0, -1), assuming Z-down frame.
+ * - Actual gravity direction will be refined during IMU initialization.
+ * - Noise covariance Q is obtained from process_noise_cov().
+ */
 ImuProcess::ImuProcess()
     : b_first_frame_(true), imu_need_init_(true), start_timestamp_(-1)
 {
@@ -90,10 +140,37 @@ ImuProcess::ImuProcess()
   Lidar_T_wrt_IMU = Zero3d;                   // lidar到IMU的位置外参初始化
   Lidar_R_wrt_IMU = Eye3d;                    // lidar到IMU的旋转外参初始化
   last_imu_.reset(new sensor_msgs::Imu());    //上一帧imu初始化
+  Q_world_gravity_aligned = Eigen::Quaterniond::Identity();
 }
 
+/**
+ * @brief Destructor for ImuProcess.
+ *
+ * Currently does not perform explicit resource cleanup since
+ * smart pointers (e.g., shared_ptr) are used.
+ *
+ * @note
+ * - Ensure no external references rely on internal pointers after destruction.
+ */
 ImuProcess::~ImuProcess() {}
 
+/**
+ * @brief Reset IMU processing state to initial conditions.
+ *
+ * This function clears all internal states and prepares the system
+ * for a fresh initialization phase.
+ *
+ * Reset includes:
+ * - Mean acceleration and angular velocity
+ * - Last IMU measurements
+ * - Stored IMU trajectory (IMUpose)
+ * - Initialization flags and counters
+ * - Current point cloud buffer
+ *
+ * @note
+ * - This will force IMU re-initialization on next Process() call.
+ * - Should be used when system experiences failure or relocalization.
+ */
 void ImuProcess::Reset()   //重置参数
 {
   // ROS_WARN("Reset ImuProcess");
@@ -109,6 +186,26 @@ void ImuProcess::Reset()   //重置参数
 }
 
 //传入外部参数
+/**
+ * @brief Set external parameters for IMU-LiDAR system.
+ *
+ * This function configures:
+ * - Extrinsic calibration between LiDAR and IMU
+ * - Measurement noise covariance scaling
+ * - Bias noise covariance
+ *
+ * @param[in] transl Translation from LiDAR to IMU frame
+ * @param[in] rot Rotation from LiDAR to IMU frame
+ * @param[in] gyr Gyroscope noise covariance scaling
+ * @param[in] acc Accelerometer noise covariance scaling
+ * @param[in] gyr_bias Gyroscope bias covariance
+ * @param[in] acc_bias Accelerometer bias covariance
+ *
+ * @note
+ * - Extrinsics are critical for accurate motion compensation.
+ * - Incorrect calibration will directly degrade SLAM accuracy.
+ * - Units must match system convention (e.g., m, rad/s, m/s²).
+ */
 void ImuProcess::set_param(const V3D &transl, const M3D &rot, const V3D &gyr, const V3D &acc, const V3D &gyr_bias, const V3D &acc_bias)  
 {
   Lidar_T_wrt_IMU = transl;
@@ -121,6 +218,22 @@ void ImuProcess::set_param(const V3D &transl, const M3D &rot, const V3D &gyr, co
 
 
 //IMU初始化：利用开始的IMU帧的平均值初始化状态量x
+/**
+ * @brief Initialize IMU-related states using early measurements.
+ *
+ * This function estimates:
+ * - Gravity direction (from averaged acceleration)
+ * - Gyroscope bias
+ * - Initial covariance
+ *
+ * @param[in] meas Measurement group containing IMU and LiDAR data
+ * @param[in,out] kf_state ESKF state (will be initialized)
+ * @param[in,out] N Number of time this function called
+ *
+ * @note
+ * - Assumes the system is static during initialization
+ * - Uses incremental mean and covariance estimation
+ */
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, int &N)
 {
   //MeasureGroup这个struct表示当前过程中正在处理的所有数据，包含IMU队列和一帧lidar的点云 以及lidar的起始和结束时间
@@ -146,8 +259,8 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
 
-    mean_acc  += (cur_acc - mean_acc) / N;    //根据当前帧和均值差作为均值的更新
-    mean_gyr  += (cur_gyr - mean_gyr) / N;
+    mean_acc += (cur_acc - mean_acc) / N;    //根据当前帧和均值差作为均值的更新
+    mean_gyr += (cur_gyr - mean_gyr) / N;
 
     cov_acc = cov_acc * (N - 1.0) / N + (cur_acc - mean_acc).cwiseProduct(cur_acc - mean_acc)  / N;
     cov_gyr = cov_gyr * (N - 1.0) / N + (cur_gyr - mean_gyr).cwiseProduct(cur_gyr - mean_gyr)  / N / N * (N-1);
@@ -158,17 +271,17 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
   state_ikfom init_state = kf_state.get_x();        //在esekfom.hpp获得x_的状态
   init_state.grav = - mean_acc / mean_acc.norm() * G_m_s2;    //得平均测量的单位方向向量 * 重力加速度预设值
   
-  init_state.bg  = mean_gyr;      //角速度测量作为陀螺仪偏差
+  init_state.bg = mean_gyr;      //角速度测量作为陀螺仪偏差
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;      //将lidar和imu外参传入
   init_state.offset_R_L_I = Sophus::SO3(Lidar_R_wrt_IMU);
   kf_state.change_x(init_state);      //将初始化后的状态传入esekfom.hpp中的x_
 
   Matrix<double, 24, 24> init_P = MatrixXd::Identity(24,24);      //在esekfom.hpp获得P_的协方差矩阵
-  init_P(6,6) = init_P(7,7) = init_P(8,8) = 0.00001;
-  init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
-  init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;
-  init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
-  init_P(21,21) = init_P(22,22) = init_P(23,23) = 0.00001; 
+  init_P(6,6) = init_P(7,7) = init_P(8,8) = 0.00001;  // Uncertainty of Lidar to IMU extrinsics (offset_R_L_I)
+  init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;  // Uncertainty of Lidar to IMU extrinsics (offset_T_L_I)
+  init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;  // Gyroscope random walk (bg)
+  init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;  // Accelerometer random walk (ba)
+  init_P(21,21) = init_P(22,22) = init_P(23,23) = 0.00001;  // Uncertainty of gravity vector
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
 
@@ -176,6 +289,23 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
 }
 
 //反向传播
+/**
+ * @brief Undistort LiDAR point cloud using IMU motion compensation.
+ *
+ * Steps:
+ * 1. Forward propagate IMU states using mid-point integration
+ * 2. Store pose trajectory (IMUpose)
+ * 3. Backward compensate each LiDAR point to scan end time
+ *
+ * @param[in] meas Measurement group (IMU + LiDAR)
+ * @param[in,out] kf_state Current ESKF state
+ * @param[out] pcl_out Undistorted point cloud
+ *
+ * @note
+ * - LiDAR points must be sorted by timestamp
+ * - Each point's timestamp is stored in curvature field
+ * - Uses exponential map for rotation integration
+ */
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state, PointCloudXYZI &pcl_out)
 {
   /***将上一帧最后尾部的imu添加到当前帧头部的imu ***/
@@ -188,7 +318,6 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
   // 根据点云中每个点的时间戳对点云进行重排序
   pcl_out = *(meas.lidar);
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);  //这里curvature中存放了时间戳（在preprocess.cpp中）
-
 
   state_ikfom imu_state = kf_state.get_x();  // 获取上一次KF估计的后验状态作为本次IMU预测的初始状态
   IMUpose.clear();
@@ -254,10 +383,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
     IMUpose.push_back( set_pose6d( offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.matrix() ) );
   }
 
-  // 把最后一帧IMU测量也补上
+  // 把最后一帧IMU测量也补上   
   dt = abs(pcl_end_time - imu_end_time);
   kf_state.predict(dt, Q, in);
-  imu_state = kf_state.get_x();   
+  imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();              //保存最后一个IMU测量，以便于下一帧使用
   last_lidar_end_time_ = pcl_end_time;      //保存这一帧最后一个雷达测量的结束时间，以便于下一帧使用
 
@@ -300,8 +429,40 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
   }
 }
 
+/**
+ * @brief Calculate rotation matrix between two vectors.
+ *
+ * @param[in] u Vector No. 1
+ * @param[in] v Vector No. 2
+ * @param[out] out_q Output rotation q
+ *
+ */
+void ImuProcess::GetRotationBetweenVectors(const V3D &u, const V3D &v, Eigen::Quaterniond &out_q)
+{
+  V3D unit_u = u.normalized();
+  V3D unit_v = v.normalized();
 
-double T1,T2;
+  out_q.setFromTwoVectors(unit_u, unit_v);
+
+  return;
+}
+
+//double T1,T2;
+
+/**
+ * @brief Main entry for IMU processing.
+ *
+ * Workflow:
+ * - If IMU is not initialized → run IMU_init()
+ * - Else → perform motion compensation on LiDAR
+ *
+ * @param[in] meas Measurement group
+ * @param[in,out] kf_state ESKF state
+ * @param[out] cur_pcl_un_ Output undistorted point cloud
+ *
+ * @warning
+ * - Will return early if IMU data is missing
+ */
 void ImuProcess::Process(const MeasureGroup &meas, esekfom::esekf &kf_state, PointCloudXYZI::Ptr &cur_pcl_un_)
 {
   // T1 = omp_get_wtime();
@@ -309,19 +470,25 @@ void ImuProcess::Process(const MeasureGroup &meas, esekfom::esekf &kf_state, Poi
   if(meas.imu.empty()) {return;};
   ROS_ASSERT(meas.lidar != nullptr);
 
-  if (imu_need_init_)   
+  if (imu_need_init_)
   {
     // The very first lidar frame
     IMU_init(meas, kf_state, init_iter_num);  //如果开头几帧  需要初始化IMU参数
 
     imu_need_init_ = true;
-    
-    last_imu_   = meas.imu.back();
+
+    last_imu_ = meas.imu.back();
 
     state_ikfom imu_state = kf_state.get_x();
 
     if (init_iter_num > MAX_INI_COUNT)
     {
+      // Calculate angle between gravity and downward
+      V3D grav = - mean_acc / mean_acc.norm();
+      V3D down = V3D(0, 0, -1.0);
+      GetRotationBetweenVectors(grav, down, Q_world_gravity_aligned);
+
+      // Assign covariance
       cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;
 
@@ -333,7 +500,7 @@ void ImuProcess::Process(const MeasureGroup &meas, esekfom::esekf &kf_state, Poi
     return;
   }
 
-  UndistortPcl(meas, kf_state, *cur_pcl_un_); 
+  UndistortPcl(meas, kf_state, *cur_pcl_un_);
 
   // T2 = omp_get_wtime();
   // cout<<"[ IMU Process ]: Time: "<<T2 - T1<<endl;
